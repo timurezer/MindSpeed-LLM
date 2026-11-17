@@ -12,7 +12,7 @@ See `docs/qlora_master_support.md` for the implementation map and validation sta
 
 ## Constraints
 
-- **Do not run anything on the NPUs.** The user explicitly prohibited NPU execution. Use local/static or CPU-only checks unless the user gives new explicit permission.
+- **Do not run NPU workloads while the devices are in use, and wait for the user's explicit go-ahead.** Running on busy devices may interfere with colleagues' results. The user will say when NPUs are available. Until then, use only local/static or CPU-only checks.
 - Preserve current master fixes, including the sequence auxiliary-loss and LoRA pipeline-stage-0 fixes. Do not replace current files wholesale with versions from the old QLoRA fork.
 - Do not apply `patches/shanghai_changes.patch` from the old project directly; it contains debug code and obsolete implementation details.
 - `convert_ckpt_v2.py` and some checkpoint files use CRLF line endings. Preserve them. For whitespace checks, use `git -c core.whitespace=cr-at-eol diff --check`.

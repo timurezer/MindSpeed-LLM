@@ -53,7 +53,7 @@ The old `ds_qlora_support` branch was used as a reference, but its patches were 
 - The working tree was clean after the two implementation commits.
 - Imports passed in `lab-th_va25_qlora` with bitsandbytes 0.45.3.
 - The bf16 `_store_weight` path preserved dtype and values and returned an independent tensor.
-- Before the user prohibited NPU execution, two small smoke checks passed:
+- Before NPU access was paused because colleagues were using the devices, two small smoke checks passed:
   - a 64x64 bf16 tensor produced packed NF4 data and all three expected quantization-state entries;
   - a mixed state dict loaded one prefix as NF4 while leaving another prefix bf16.
 
@@ -65,4 +65,4 @@ The old `ds_qlora_support` branch was used as a reference, but its patches were 
 - Loss agreement with bf16 LoRA.
 - Adapter saving and export.
 
-No full conversion or training run has been performed. Do not claim end-to-end support is validated until these checks are completed with explicit user authorization for NPU execution.
+No full conversion or training run has been performed. Do not claim end-to-end support is validated until these checks are completed. NPU workloads require the user's explicit go-ahead and must not run while devices are in use by colleagues.
