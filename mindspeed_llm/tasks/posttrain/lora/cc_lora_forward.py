@@ -19,14 +19,17 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
+
 
 def dequantize(weight, dtype, device):
-    if hasattr(weight, "quant_state"):
-        raise RuntimeError(
-            "Detected weights contains `quant_state`, but the `bitsandbytes` dependency has been removed. "
-            "Please ensure that non-quantized model weights are being used."
-        )
-    return weight, True
+    if not hasattr(weight, "quant_state"):
+        return weight, True
+    dequantize_weight = bnb.functional.dequantize_4bit(weight.data, weight.quant_state).to(device).to(dtype)
+    return dequantize_weight, False
 
 
 def get_communication_output(input_, reduce_tensor=False):

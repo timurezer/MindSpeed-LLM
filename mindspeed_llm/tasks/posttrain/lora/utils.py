@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+
 from megatron.training import get_args
 
 
@@ -27,6 +29,16 @@ def is_enable_lora():
     if hasattr(args, 'lora_target_modules') and args.lora_target_modules:
         return True
     return False
+
+
+def is_enable_qlora(args=None):
+    args = args if args else get_args()
+    if hasattr(args, 'qlora') and args.qlora:
+        return True
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--qlora-nf4', action='store_true')
+    args, _ = parser.parse_known_args()
+    return args.qlora_nf4
 
 
 def merge_dicts(dict1, dict2):

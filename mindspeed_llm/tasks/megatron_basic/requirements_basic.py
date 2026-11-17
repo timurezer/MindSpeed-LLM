@@ -49,7 +49,7 @@ def _load_from_state_dict_wrapper(fn):
                 missing_keys[:] = [
                     key for key in missing_keys if 'lora_a' not in key.lower() and 'lora_b' not in key.lower()
                 ]
-            filter_keys = ('absmax', 'quant_map', '_extra_state')
+            filter_keys = ('absmax', 'quant_map', 'bitsandbytes__nf4', '_extra_state')
             unexpected_keys[:] = [key for key in unexpected_keys if not key.endswith(filter_keys)]
 
     return wrapper

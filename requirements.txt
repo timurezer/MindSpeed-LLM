@@ -9,4 +9,5 @@ pybind11
 peft
 tiktoken
 ray
+bitsandbytes-npu-beta
 mistral_common

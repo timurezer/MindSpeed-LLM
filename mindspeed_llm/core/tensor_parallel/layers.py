@@ -38,6 +38,11 @@ from megatron.core.tensor_parallel.mappings import (
 
 from mindspeed_llm.training.utils import get_actual_seq_len_list, set_actual_seq_len_list
 
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
+
 
 def vocab_embedding_init_func(
     self,
@@ -324,7 +329,9 @@ class LinearNoTP(torch.nn.Linear):
         )
 
     def forward(self, input_):
-        if get_args().fp8 and input_.dtype != torch.float32:
+        if hasattr(self.weight, "quant_state"):
+            output = bnb.matmul_4bit(input_, self.weight.t(), self.weight.quant_state, bias=self.bias)
+        elif get_args().fp8 and input_.dtype != torch.float32:
             from mindspeed.te.pytorch.fp8.recipes import matmul_fp8
 
             output = matmul_fp8(input_, self.weight)
@@ -337,7 +344,29 @@ class LinearNoTP(torch.nn.Linear):
         return output
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        args = get_args()
+        if args.qlora_save_dequantize and getattr(self.weight, "quant_state", None) is not None:
+            self.weight = torch.nn.Parameter(bnb.functional.dequantize_4bit(self.weight.data, self.weight.quant_state))
         super()._save_to_state_dict(destination, prefix, keep_vars)
         if getattr(self.weight, "quant_state", None) is not None:
             for k, v in self.weight.quant_state.as_dict(packed=True).items():
                 destination[prefix + "weight." + k] = v if keep_vars else v.detach()
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if any('bitsandbytes' in key for key in state_dict):
+            qs_dict = {}
+            for key, value in state_dict.items():
+                key = key.replace(prefix, "")
+                if key != '_extra_state':
+                    qs_dict[key] = value
+            self.weight = bnb.nn.Params4bit.from_prequantized(
+                data=qs_dict.get('weight'),
+                quantized_stats={key.replace('weight.', ''): qs_dict[key] for key in qs_dict if key != 'weight'},
+                requires_grad=False,
+                device='npu',
+            )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )

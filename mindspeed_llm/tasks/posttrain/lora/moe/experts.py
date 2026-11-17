@@ -40,6 +40,11 @@ from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (
 from mindspeed.core.transformer.moe.moe_feature import permute, sort_chunks_by_idxs, parallel_state
 from mindspeed_llm.tasks.posttrain.lora.cc_lora_forward import dequantize
 
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
+
 
 class LoraParallelGroupedMlpWithCompAndCommOverlapAll2AllSEQ(torch.autograd.Function):
     @staticmethod
@@ -671,8 +676,14 @@ class LoraParallelGroupedMLP(GroupedMLP):
         if hasattr(self.weight1, "quant_state"):
             if args.moe_alltoall_overlap_comm:
                 w1, w2 = self.weight1, self.weight2
+            else:
+                w1 = bnb.functional.dequantize_4bit(self.weight1.data, self.weight1.quant_state).to(
+                    permuted_local_hidden_states.dtype
+                )
+                w2 = bnb.functional.dequantize_4bit(self.weight2.data, self.weight2.quant_state).to(
+                    permuted_local_hidden_states.dtype
+                )
 
-        args = get_args()
         # alltoall-overlap-comm
         if args.moe_alltoall_overlap_comm:
             group_list = torch.cumsum(tokens_per_expert, dim=0)
