@@ -41,6 +41,7 @@ from mindspeed.model.transformer import should_recompute_norm
 
 from mindspeed_llm.core.tensor_parallel.layers import LinearNoTP
 from mindspeed_llm.core.transformer.custom_layers.transformer_engine import PTNorm
+from mindspeed_llm.tasks.posttrain.lora.cc_lora_forward import dequantize
 from mindspeed_llm.tasks.models.transformer.deepseek4.compressor import get_compressor_spec
 from mindspeed_llm.tasks.models.transformer.dsa_indexer import (
     get_dsa_indexer_spec,
@@ -651,8 +652,9 @@ class DeepSeek4SelfAttention(MegatronModule):
         return self.linear_o_up_proj(o)[0]
 
     def _linear_o_down_proj(self, grouped_output):
+        weight, _ = dequantize(self.linear_o_down_proj.weight, grouped_output.dtype, grouped_output.device)
         weight_woa = rearrange(
-            self.linear_o_down_proj.weight,
+            weight,
             '(g l) (d h)->g l (d h)',  # outdim*indim
             d=self.head_dim // self.n_groups,
             l=self.o_lora_rank,

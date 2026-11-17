@@ -22,6 +22,7 @@ from typing import Dict, List, Set, Tuple, Optional, Any, Union
 
 import torch
 import safetensors.torch
+import bitsandbytes as bnb
 
 from .convert_hf2mg import Hf2MgConvert
 from .convert_mg2hf import Mg2HfConvert, load_data, TENSOR_SIZE
@@ -94,6 +95,9 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                     self.num_layers // self.pipeline_model_parallel_size // self.num_layers_per_virtual_pipeline_stage
                 )
 
+        if self.qlora_nf4 and self.transformer_impl != 'local':
+            raise ValueError('qlora-nf4 is only supported with transformer-impl local')
+
         # moe flags
         self.moe_grouped_gemm = getattr(args, "moe_grouped_gemm", False)
         self.moe_tp_extend_ep = getattr(args, "moe_tp_extend_ep", False)
@@ -116,6 +120,16 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
         else:
             self.vpprank_layer_idxs = defaultdict(dict)
             self._get_vpprank_hf_layeridxs()
+
+    def _store_weight(self, state_dict, key, weight):
+        if not self.qlora_nf4:
+            state_dict[key] = weight.clone()
+            return
+
+        quant_weight = bnb.nn.Params4bit(weight, requires_grad=weight.requires_grad, quant_type='nf4').to('npu').cpu()
+        state_dict[key] = quant_weight.data
+        for quant_key, value in quant_weight.quant_state.as_dict(packed=True).items():
+            state_dict[f"{key}.{quant_key}"] = value.detach()
 
     def __parameter_packaging(self):
         args = argparse.Namespace()
@@ -556,7 +570,7 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tensor_model_parallel_size):
                 mg_model[ep_rank][tp_rank]["final_layernorm.weight"] = final_norm.clone()
-                mg_model[ep_rank][tp_rank]["output_layer.weight"] = lm_head_lst[tp_rank].clone()
+                self._store_weight(mg_model[ep_rank][tp_rank], "output_layer.weight", lm_head_lst[tp_rank])
                 mg_model[ep_rank][tp_rank]["hc_head.hc_base"] = hc_base.clone()
                 mg_model[ep_rank][tp_rank]["hc_head.hc_fn.weight"] = hc_fn.clone()
                 mg_model[ep_rank][tp_rank]["hc_head.hc_scale"] = hc_scale.clone()
@@ -583,7 +597,7 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                 sd = mg_model[ep_rank][tp_rank]
                 sd[f"mtp.layers.{mtp_layer_idx}.enorm.weight"] = enorm.clone()
                 sd[f"mtp.layers.{mtp_layer_idx}.hnorm.weight"] = hnorm.clone()
-                sd[f"mtp.layers.{mtp_layer_idx}.eh_proj.weight"] = eh_lst[tp_rank].clone()
+                self._store_weight(sd, f"mtp.layers.{mtp_layer_idx}.eh_proj.weight", eh_lst[tp_rank])
                 if self.pipeline_model_parallel_size > 1:
                     sd["embedding.word_embeddings.weight"] = emb_lst[tp_rank].clone()
 
@@ -692,11 +706,11 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                 sd[f"{prefix}.kv_layernorm.weight"] = kv_norm.clone()
                 sd[f"{prefix}.q_layernorm.weight"] = q_norm.clone()
 
-                sd[f"{prefix}.linear_o_down_proj.weight"] = wo_a_lst[tp_rank].clone()
-                sd[f"{prefix}.linear_kv.weight"] = wkv_lst[tp_rank].clone()
+                self._store_weight(sd, f"{prefix}.linear_o_down_proj.weight", wo_a_lst[tp_rank])
+                self._store_weight(sd, f"{prefix}.linear_kv.weight", wkv_lst[tp_rank])
                 sd[f"{prefix}.linear_o_up_proj.weight"] = wo_b_lst[tp_rank].clone()
-                sd[f"{prefix}.linear_q.weight"] = wq_a_lst[tp_rank].clone()
-                sd[f"{prefix}.linear_q_up_proj.weight"] = wq_b_lst[tp_rank].clone()
+                self._store_weight(sd, f"{prefix}.linear_q.weight", wq_a_lst[tp_rank])
+                self._store_weight(sd, f"{prefix}.linear_q_up_proj.weight", wq_b_lst[tp_rank])
 
                 if (not mtp_layer_flag) and cr != 0:
                     sd[f"{prefix}.compressor.ape"] = comp["ape"].clone()
@@ -800,8 +814,12 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                 else:
                     sd[f"{mg_prefix}.mlp.router.tid2eid"] = tid2eid.clone()
 
-                sd[f"{mg_prefix}.mlp.shared_experts.linear_fc1.weight"] = shared_fc1_lst[tp_rank].clone()
-                sd[f"{mg_prefix}.mlp.shared_experts.linear_fc2.weight"] = shared_fc2_lst[tp_rank].clone()
+                self._store_weight(
+                    sd, f"{mg_prefix}.mlp.shared_experts.linear_fc1.weight", shared_fc1_lst[tp_rank]
+                )
+                self._store_weight(
+                    sd, f"{mg_prefix}.mlp.shared_experts.linear_fc2.weight", shared_fc2_lst[tp_rank]
+                )
 
                 sd[f"{mg_prefix}.attn_mhc.hc_base"] = hc_attn_base.clone()
                 sd[f"{mg_prefix}.attn_mhc.hc_fn.weight"] = hc_attn_fn.clone()
@@ -875,8 +893,8 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                         idx = ep_rank * self.tensor_model_parallel_size + tp_rank
                         w1p = fc1_chunks[idx].reshape(hidden, -1).contiguous()
                         w2p = fc2_chunks[idx].reshape(-1, hidden).contiguous()
-                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1p.clone()
-                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2p.clone()
+                        self._store_weight(mg_model[ep_rank][tp_rank], experts_weight1_key, w1p)
+                        self._store_weight(mg_model[ep_rank][tp_rank], experts_weight2_key, w2p)
             else:
                 fc1_ep = torch.chunk(fc1_3d, self.ep_size, dim=0)
                 fc2_ep = torch.chunk(fc2_3d, self.ep_size, dim=0)
@@ -884,8 +902,8 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                     w1_ep_full = fc1_ep[ep_rank].reshape(hidden, -1).contiguous()
                     w2_ep_full = fc2_ep[ep_rank].reshape(-1, hidden).contiguous()
                     for tp_rank in range(self.tensor_model_parallel_size):
-                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1_ep_full.clone()
-                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2_ep_full.clone()
+                        self._store_weight(mg_model[ep_rank][tp_rank], experts_weight1_key, w1_ep_full)
+                        self._store_weight(mg_model[ep_rank][tp_rank], experts_weight2_key, w2_ep_full)
         else:
             if self.moe_tp_extend_ep:
                 for ep_rank in range(self.ep_size):
@@ -894,12 +912,16 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
                         for local_e, global_e in enumerate(range(start_e, end_e)):
                             fc1_full = experts_linear_fc1_list[global_e].t().contiguous()
                             fc2_full = experts_linear_fc2_list[global_e].t().contiguous()
-                            mg_model[ep_rank][tp_rank][
-                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc1.weight"
-                            ] = fc1_full.clone()
-                            mg_model[ep_rank][tp_rank][
-                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc2.weight"
-                            ] = fc2_full.clone()
+                            self._store_weight(
+                                mg_model[ep_rank][tp_rank],
+                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc1.weight",
+                                fc1_full,
+                            )
+                            self._store_weight(
+                                mg_model[ep_rank][tp_rank],
+                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc2.weight",
+                                fc2_full,
+                            )
             else:
                 num_local_experts = self.num_experts // self.ep_size
                 for ep_rank in range(self.ep_size):
@@ -913,12 +935,16 @@ class DeepSeek4Hf2MgConvert(Hf2MgConvert):
 
                         for tp_rank in range(self.tensor_model_parallel_size):
                             etp = self._expert_tp_rank(tp_rank)
-                            mg_model[ep_rank][tp_rank][
-                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc1.weight"
-                            ] = fc1_lst[etp].clone()
-                            mg_model[ep_rank][tp_rank][
-                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc2.weight"
-                            ] = fc2_lst[etp].clone()
+                            self._store_weight(
+                                mg_model[ep_rank][tp_rank],
+                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc1.weight",
+                                fc1_lst[etp],
+                            )
+                            self._store_weight(
+                                mg_model[ep_rank][tp_rank],
+                                f"{mg_prefix}.mlp.experts.local_experts.{local_e}.linear_fc2.weight",
+                                fc2_lst[etp],
+                            )
 
     # ---------------- run ----------------
     def run(self):

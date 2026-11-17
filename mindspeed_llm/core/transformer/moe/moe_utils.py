@@ -157,6 +157,8 @@ def topk_softmax_with_capacity_and_hash(
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
             input_ids = input_ids.chunk(tp_size)[tp_rank]
+            if tid2eid.device != input_ids.device:
+                tid2eid = tid2eid.to(input_ids.device)
             top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
             # print(f"[debug] top_indices shape is: {top_indices.shape}")
             # print(f"[debug] top_indices is {top_indices}")
@@ -308,6 +310,8 @@ def topk_softmax_with_capacity(
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
             input_ids = input_ids.chunk(tp_size)[tp_rank]
+            if tid2eid.device != input_ids.device:
+                tid2eid = tid2eid.to(input_ids.device)
             top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
             # print(f"[debug] top_indices shape is: {top_indices.shape}")
             # print(f"[debug] top_indices is {top_indices}")

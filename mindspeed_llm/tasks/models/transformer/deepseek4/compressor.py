@@ -377,7 +377,8 @@ class Compressor(MegatronModule):
                 score = score[:, :cutoff]
 
             kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio)) + self.ape
+            ape = self.ape.to(score.device) if self.ape.device != score.device else self.ape
+            score = score.unflatten(1, (-1, ratio)) + ape
             if overlap:
                 kv = self.overlap_transform_with_sp_cp(kv, 0)
                 score = self.overlap_transform_with_sp_cp(score, float("-inf"))

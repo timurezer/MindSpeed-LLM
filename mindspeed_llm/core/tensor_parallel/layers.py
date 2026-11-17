@@ -355,15 +355,20 @@ class LinearNoTP(torch.nn.Linear):
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
-        if any('bitsandbytes' in key for key in state_dict):
+        quantized_state_key = prefix + 'weight.quant_state.bitsandbytes__nf4'
+        if quantized_state_key in state_dict:
             qs_dict = {}
             for key, value in state_dict.items():
-                key = key.replace(prefix, "")
+                if not key.startswith(prefix):
+                    continue
+                key = key[len(prefix) :]
                 if key != '_extra_state':
                     qs_dict[key] = value
             self.weight = bnb.nn.Params4bit.from_prequantized(
                 data=qs_dict.get('weight'),
-                quantized_stats={key.replace('weight.', ''): qs_dict[key] for key in qs_dict if key != 'weight'},
+                quantized_stats={
+                    key.replace('weight.', ''): qs_dict[key] for key in qs_dict if key not in ('weight', 'bias')
+                },
                 requires_grad=False,
                 device='npu',
             )

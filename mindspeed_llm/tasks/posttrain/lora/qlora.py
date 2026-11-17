@@ -81,12 +81,15 @@ def parallel_linear_save_to_state_dict_wrapper(fn):
 
 def parallel_linear_load_from_state_dict_wrapper(fn):
     def wrapper(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        if any('bitsandbytes' in i for i in state_dict.keys()):  # is quantized linear
+        quantized_state_key = prefix + 'weight.quant_state.bitsandbytes__nf4'
+        if quantized_state_key in state_dict:
             qs_dict = {}
-            for k, v in state_dict.items():
-                key = k.replace(prefix, "")
+            for key, value in state_dict.items():
+                if not key.startswith(prefix):
+                    continue
+                key = key[len(prefix) :]
                 if key != '_extra_state':
-                    qs_dict[key] = v
+                    qs_dict[key] = value
 
             self.weight = bnb.nn.Params4bit.from_prequantized(
                 data=qs_dict.get('weight'),
@@ -176,6 +179,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # GPU allocation.
     for model_module in model:
         if is_enable_qlora():
+            for name, param in model_module.base_model.named_parameters():
+                if name.endswith(("attn_sink", "ape", "hc_base", "hc_scale")):
+                    param.data = param.data.to(torch.cuda.current_device())
+
             for name, module in model_module.base_model.named_modules():
                 if not hasattr(module, "weight") or hasattr(module, "base_layer"):
                     continue
