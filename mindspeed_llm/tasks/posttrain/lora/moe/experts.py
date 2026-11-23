@@ -39,6 +39,7 @@ from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (
 )
 from mindspeed.core.transformer.moe.moe_feature import permute, sort_chunks_by_idxs, parallel_state
 from mindspeed_llm.tasks.posttrain.lora.cc_lora_forward import dequantize
+from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
 
 try:
     import bitsandbytes as bnb
@@ -494,7 +495,25 @@ def lora_parallel_grouped_mlp_with_comp_and_comm_overlap_all2all_seq(
 
 class LoraParallelGroupedMLP(GroupedMLP):
     def __init__(self, num_local_experts, config, lora_config):
-        super().__init__(num_local_experts, config=config)
+        # QLoRA with a base checkpoint: weight1/weight2 are replaced wholesale by
+        # Params4bit in groupedmlp_load_from_state_dict_wrapper, so their random
+        # init values are never used. Without this, the default GPU init path
+        # allocates the full bf16 expert weights on NPU plus fp32 normal_
+        # temporaries of 2x each weight size, and they stay alive until the
+        # checkpoint load frees them — the full model OOMs at build time.
+        # Allocate empty CPU tensors with no init math instead: unlike
+        # --use-cpu-initialization this skips the slow master-weight init and
+        # costs no NPU memory.
+        if is_enable_qlora() and getattr(get_args(), "load", None):
+            saved = (config.use_cpu_initialization, config.perform_initialization)
+            config.use_cpu_initialization = True
+            config.perform_initialization = False
+            try:
+                super().__init__(num_local_experts, config=config)
+            finally:
+                config.use_cpu_initialization, config.perform_initialization = saved
+        else:
+            super().__init__(num_local_experts, config=config)
         self.lora_r = lora_config.r
         self.scaling = lora_config.lora_alpha / self.lora_r
 
