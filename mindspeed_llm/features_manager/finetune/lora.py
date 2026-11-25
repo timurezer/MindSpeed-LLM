@@ -52,11 +52,28 @@ class LoraFeature(MindSpeedFeature):
             help='Dequantize weights to original precision when saving in QLoRA tuning.',
         )
 
+        qlora_opt_group = parser.add_argument_group(title='qlora memory optimizations')
+        qlora_opt_group.add_argument(
+            '--bnb-dequant-patch',
+            action='store_true',
+            default=False,
+            help='Patch the bitsandbytes NPU NF4 dequantize kernel calls to run in chunks through '
+                 'a small reusable fp32 staging buffer instead of materializing full-size fp32 and '
+                 'bf16 temporaries (~3x peak reduction per dequantize call). Numerically identical '
+                 'to stock; chunk sizes keep every kernel call at coreNum == blockDim == 40, the '
+                 'only regime the prebuilt AscendC kernel is correct in.',
+        )
+
     def register_patches(self, patch_manager, args):
         # for qlora
         from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
 
         if is_enable_qlora(args):
+            if getattr(args, 'bnb_dequant_patch', False):
+                from mindspeed_llm.tasks.checkpoint.patch_bnb import apply_bnb_npu_patches
+
+                apply_bnb_npu_patches()
+
             from mindspeed_llm.tasks.posttrain.lora.qlora import get_model
             from mindspeed_llm.tasks.posttrain.lora.qlora import (
                 parallel_linear_init_wrapper,
@@ -140,6 +157,11 @@ class LoraFeature(MindSpeedFeature):
             )
 
     def validate_args(self, args):
+        from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
+
+        if getattr(args, 'bnb_dequant_patch', False) and not is_enable_qlora(args):
+            raise AssertionError('--bnb-dequant-patch is only supported with --qlora.')
+
         has_valid_lora_target = hasattr(args, 'lora_target_modules') and args.lora_target_modules
 
         if args.num_experts and (has_valid_lora_target and args.moe_token_dispatcher_type != "alltoall_seq"):  # nosec
