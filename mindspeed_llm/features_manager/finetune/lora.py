@@ -63,6 +63,26 @@ class LoraFeature(MindSpeedFeature):
                  'to stock; chunk sizes keep every kernel call at coreNum == blockDim == 40, the '
                  'only regime the prebuilt AscendC kernel is correct in.',
         )
+        qlora_opt_group.add_argument(
+            '--expert-dequant-recompute',
+            action='store_true',
+            default=False,
+            help='Dequantize the NF4 expert weights (GroupedMLP w1/w2) locally inside the grouped '
+                 'GEMM autograd function, in forward and again in backward, instead of '
+                 'pre-dequantizing them in LoraParallelGroupedMLP.forward and pinning the full '
+                 'bf16 copies in the autograd graph until backward. At most one transient '
+                 'dequantized weight exists at any time. Applies to the non-overlap MoE path.',
+        )
+        qlora_opt_group.add_argument(
+            '--expert-chunk-size',
+            type=int,
+            default=0,
+            help='Process the local experts in chunks of this many experts in the quantized '
+                 'grouped GEMM: only this many experts are dequantized at any time (forward and '
+                 'backward), capping the transient bf16 weight memory at chunk/num_local_experts '
+                 'of the full copy. Requires --expert-dequant-recompute. 0 (default) processes '
+                 'the full weight in a single call; values >= num_local_experts behave as 0.',
+        )
 
     def register_patches(self, patch_manager, args):
         # for qlora
@@ -161,6 +181,12 @@ class LoraFeature(MindSpeedFeature):
 
         if getattr(args, 'bnb_dequant_patch', False) and not is_enable_qlora(args):
             raise AssertionError('--bnb-dequant-patch is only supported with --qlora.')
+
+        if getattr(args, 'expert_dequant_recompute', False) and not is_enable_qlora(args):
+            raise AssertionError('--expert-dequant-recompute is only supported with --qlora.')
+
+        if getattr(args, 'expert_chunk_size', 0) and not getattr(args, 'expert_dequant_recompute', False):
+            raise AssertionError('--expert-chunk-size requires --expert-dequant-recompute.')
 
         has_valid_lora_target = hasattr(args, 'lora_target_modules') and args.lora_target_modules
 

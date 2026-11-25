@@ -39,6 +39,11 @@ from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (
 )
 from mindspeed.core.transformer.moe.moe_feature import permute, sort_chunks_by_idxs, parallel_state
 from mindspeed_llm.tasks.posttrain.lora.cc_lora_forward import dequantize
+from mindspeed_llm.tasks.posttrain.lora.qlora import (
+    expert_chunk_size,
+    expert_dequant_recompute_enabled,
+    quantized_expert_gmm,
+)
 from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
 
 try:
@@ -692,16 +697,25 @@ class LoraParallelGroupedMLP(GroupedMLP):
                 self.weight1.quant_state.shape = (self.config.hidden_size, w1.shape[-1] * 2)
                 self.weight2.quant_state.shape = (w2.shape[0] * 2, self.config.hidden_size)
         args = get_args()
+        quant_gmm = (
+            hasattr(self.weight1, "quant_state")
+            and not args.moe_alltoall_overlap_comm
+            and expert_dequant_recompute_enabled()
+        )
         if hasattr(self.weight1, "quant_state"):
             if args.moe_alltoall_overlap_comm:
                 w1, w2 = self.weight1, self.weight2
-            else:
+            elif not quant_gmm:
                 w1 = bnb.functional.dequantize_4bit(self.weight1.data, self.weight1.quant_state).to(
                     permuted_local_hidden_states.dtype
                 )
                 w2 = bnb.functional.dequantize_4bit(self.weight2.data, self.weight2.quant_state).to(
                     permuted_local_hidden_states.dtype
                 )
+            # With --expert-dequant-recompute the non-overlap path defers dequantization
+            # into QuantizedExpertGMMFunction, which saves only the quantized weights for
+            # backward and re-creates the bf16 copy there, so the full-size bf16 w1/w2
+            # stay transient instead of being pinned in the autograd graph until backward.
 
         # alltoall-overlap-comm
         if args.moe_alltoall_overlap_comm:
@@ -731,7 +745,16 @@ class LoraParallelGroupedMLP(GroupedMLP):
         # origin gemm
         else:
             if permuted_local_hidden_states.nelement() != 0:
-                fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
+                # one host sync per layer shared by the chunked w1/w2 expert gmm calls
+                expert_bounds = None
+                if quant_gmm and expert_chunk_size() > 0:
+                    expert_bounds = torch.cumsum(tokens_per_expert, dim=0).cpu().tolist()
+                if quant_gmm:
+                    fc1_output = quantized_expert_gmm(
+                        permuted_local_hidden_states, self.weight1, tokens_per_expert, bounds=expert_bounds
+                    )
+                else:
+                    fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
                 mm1_a = gg.ops.gmm(permuted_local_hidden_states, w1_a, tokens_per_expert, trans_b=False)
                 mm1_b = gg.ops.gmm(mm1_a, w1_b, tokens_per_expert, trans_b=False) * self.scaling
 
@@ -741,7 +764,12 @@ class LoraParallelGroupedMLP(GroupedMLP):
                     )
                     mm2_a = gg.ops.gmm(intermediate_parallel, w2_a, tokens_per_expert, trans_b=False)
                     mm2_b = gg.ops.gmm(mm2_a, w2_b, tokens_per_expert, trans_b=False) * self.scaling
-                    fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+                    if quant_gmm:
+                        fc2_output = quantized_expert_gmm(
+                            intermediate_parallel, self.weight2, tokens_per_expert, bounds=expert_bounds
+                        )
+                    else:
+                        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
                     self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
                     fc2_output += mm2_b
                 else:
@@ -751,10 +779,24 @@ class LoraParallelGroupedMLP(GroupedMLP):
 
                     mm2_a = gg.ops.gmm(intermediate_parallel, w2_a, tokens_per_expert, trans_b=False)
                     mm2_b = gg.ops.gmm(mm2_a, w2_b, tokens_per_expert, trans_b=False) * self.scaling
-                    fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+                    if quant_gmm:
+                        fc2_output = quantized_expert_gmm(
+                            intermediate_parallel, self.weight2, tokens_per_expert, bounds=expert_bounds
+                        )
+                    else:
+                        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
                     fc2_output += mm2_b
 
             else:
+                # Empty-input fallback: the top-level dequantization was skipped under
+                # --expert-dequant-recompute, so dequantize here for the matmul path.
+                if quant_gmm:
+                    w1 = bnb.functional.dequantize_4bit(self.weight1.data, self.weight1.quant_state).to(
+                        permuted_local_hidden_states.dtype
+                    )
+                    w2 = bnb.functional.dequantize_4bit(self.weight2.data, self.weight2.quant_state).to(
+                        permuted_local_hidden_states.dtype
+                    )
                 h = torch.matmul(permuted_local_hidden_states, w1)
                 mm1_a = torch.matmul(permuted_local_hidden_states, w1_a)
                 mm1_b = torch.matmul(mm1_a, w1_b) * self.scaling
