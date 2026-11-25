@@ -95,6 +95,68 @@ class QuantizedExpertGMMFunction(torch.autograd.Function):
         return dx[0], None, None, None
 
 
+def expert_chunk_size():
+    """Experts per dequantize chunk from --expert-chunk-size (0 = full weight)."""
+    return getattr(get_args(), 'expert_chunk_size', 0) or 0
+
+
+def quantized_expert_gmm(x, weight_q, tokens_per_expert, bounds=None):
+    """Grouped GEMM vs an NF4-frozen expert weight (w1 or w2 of GroupedMLP).
+
+    With --expert-chunk-size E (e.g. 16) the local experts are processed in
+    chunks of E: only E experts are dequantized at any time, both in forward
+    and in backward (each chunk is an independent QuantizedExpertGMMFunction),
+    capping the transient bf16 weight memory at E/num_local_experts of the
+    full copy instead of a full 4 GB-class tensor. Without the argument (or
+    with a value >= num_local_experts) a single full-weight call is used.
+    Tokens are permuted contiguously per expert, so chunk outputs concatenate
+    back into the full permuted output. `bounds` may carry the precomputed
+    cumsum of tokens_per_expert so the w1/w2 calls of one layer share a
+    single host sync.
+    """
+    from bitsandbytes.utils import QuantState
+
+    quant_state = weight_q.quant_state
+    chunk = expert_chunk_size()
+    full_shape = tuple(quant_state.shape)
+    num_experts = full_shape[0]
+    if chunk <= 0 or chunk >= num_experts or len(full_shape) != 3:
+        return QuantizedExpertGMMFunction.apply(x, weight_q.data, quant_state, tokens_per_expert)
+
+    per_expert_numel = full_shape[1] * full_shape[2]
+    blocksize = quant_state.blocksize
+    data_flat = weight_q.data.view(-1)
+    absmax_flat = quant_state.absmax.view(-1)
+
+    # one host sync for all chunk token boundaries; callers may pass bounds
+    # precomputed once per layer so the w1 and w2 calls share a single sync
+    if bounds is None:
+        bounds = torch.cumsum(tokens_per_expert, dim=0).cpu().tolist()
+
+    outputs = []
+    for e0 in range(0, num_experts, chunk):
+        e1 = min(e0 + chunk, num_experts)
+        start = bounds[e0 - 1] if e0 > 0 else 0
+        end = bounds[e1 - 1]
+        if end <= start:
+            continue  # no tokens routed to any expert of this chunk
+        data_slice = data_flat[e0 * per_expert_numel // 2: e1 * per_expert_numel // 2]
+        absmax_slice = absmax_flat[e0 * per_expert_numel // blocksize: e1 * per_expert_numel // blocksize]
+        qs = QuantState(
+            absmax=absmax_slice,
+            shape=(e1 - e0,) + full_shape[1:],
+            dtype=quant_state.dtype,
+            blocksize=blocksize,
+            quant_type=quant_state.quant_type,
+        )
+        outputs.append(
+            QuantizedExpertGMMFunction.apply(x[start:end], data_slice, qs, tokens_per_expert[e0:e1])
+        )
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
+
+
 def parallel_linear_save_to_state_dict_wrapper(fn):
     def wrapper(self, destination, prefix, keep_vars):
         """

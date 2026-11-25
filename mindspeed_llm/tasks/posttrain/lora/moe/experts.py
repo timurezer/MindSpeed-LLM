@@ -39,7 +39,11 @@ from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (
 )
 from mindspeed.core.transformer.moe.moe_feature import permute, sort_chunks_by_idxs, parallel_state
 from mindspeed_llm.tasks.posttrain.lora.cc_lora_forward import dequantize
-from mindspeed_llm.tasks.posttrain.lora.qlora import QuantizedExpertGMMFunction, expert_dequant_recompute_enabled
+from mindspeed_llm.tasks.posttrain.lora.qlora import (
+    expert_chunk_size,
+    expert_dequant_recompute_enabled,
+    quantized_expert_gmm,
+)
 from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
 
 try:
@@ -741,9 +745,13 @@ class LoraParallelGroupedMLP(GroupedMLP):
         # origin gemm
         else:
             if permuted_local_hidden_states.nelement() != 0:
+                # one host sync per layer shared by the chunked w1/w2 expert gmm calls
+                expert_bounds = None
+                if quant_gmm and expert_chunk_size() > 0:
+                    expert_bounds = torch.cumsum(tokens_per_expert, dim=0).cpu().tolist()
                 if quant_gmm:
-                    fc1_output = QuantizedExpertGMMFunction.apply(
-                        permuted_local_hidden_states, self.weight1.data, self.weight1.quant_state, tokens_per_expert
+                    fc1_output = quantized_expert_gmm(
+                        permuted_local_hidden_states, self.weight1, tokens_per_expert, bounds=expert_bounds
                     )
                 else:
                     fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False)
@@ -757,8 +765,8 @@ class LoraParallelGroupedMLP(GroupedMLP):
                     mm2_a = gg.ops.gmm(intermediate_parallel, w2_a, tokens_per_expert, trans_b=False)
                     mm2_b = gg.ops.gmm(mm2_a, w2_b, tokens_per_expert, trans_b=False) * self.scaling
                     if quant_gmm:
-                        fc2_output = QuantizedExpertGMMFunction.apply(
-                            intermediate_parallel, self.weight2.data, self.weight2.quant_state, tokens_per_expert
+                        fc2_output = quantized_expert_gmm(
+                            intermediate_parallel, self.weight2, tokens_per_expert, bounds=expert_bounds
                         )
                     else:
                         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
@@ -772,8 +780,8 @@ class LoraParallelGroupedMLP(GroupedMLP):
                     mm2_a = gg.ops.gmm(intermediate_parallel, w2_a, tokens_per_expert, trans_b=False)
                     mm2_b = gg.ops.gmm(mm2_a, w2_b, tokens_per_expert, trans_b=False) * self.scaling
                     if quant_gmm:
-                        fc2_output = QuantizedExpertGMMFunction.apply(
-                            intermediate_parallel, self.weight2.data, self.weight2.quant_state, tokens_per_expert
+                        fc2_output = quantized_expert_gmm(
+                            intermediate_parallel, self.weight2, tokens_per_expert, bounds=expert_bounds
                         )
                     else:
                         fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
