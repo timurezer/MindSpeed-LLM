@@ -56,6 +56,45 @@ def linear_with_frozen_weight_backward(ctx, grad_output):
     return grad_input, None, None, None
 
 
+def expert_dequant_recompute_enabled():
+    """--expert-dequant-recompute: dequantize the NF4 expert weights locally in forward and
+    again in backward instead of keeping the full bf16 copies in the autograd graph."""
+    return bool(getattr(get_args(), 'expert_dequant_recompute', False))
+
+
+class QuantizedExpertGMMFunction(torch.autograd.Function):
+    """Grouped GEMM against an NF4-quantized frozen expert weight.
+
+    Calling npu_gmm on a pre-dequantized weight makes the gmm autograd save the
+    full bf16 w1/w2 copies until backward. Here only the quantized data and
+    quant_state are saved for backward and the bf16 copy is re-created there,
+    so at most one transient dequantized weight exists at any time. Operates on
+    raw (data, quant_state) pairs so it also serves per-expert-chunk slices.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight_data, quant_state, tokens_per_expert):
+        # quant_state.shape is mutated by every LoraParallelGroupedMLP.forward,
+        # so capture the dequantized shape now and reuse it in backward.
+        dequant_shape = tuple(quant_state.shape)
+        w = bnb.functional.dequantize_4bit(weight_data, quant_state).to(x.dtype).reshape(dequant_shape)
+        group_list = torch.cumsum(tokens_per_expert, dim=0).to(x.device)
+        ctx.save_for_backward(x, weight_data, group_list)
+        ctx.quant_state = quant_state
+        ctx.dequant_shape = dequant_shape
+        outputs = GMMFunction.builder.load().npu_gmm([x], [w], [], group_list, 0, 0)
+        return outputs[0]
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        x, weight_data, group_list = ctx.saved_tensors
+        w = bnb.functional.dequantize_4bit(weight_data, ctx.quant_state).to(grad_outputs.dtype).reshape(
+            ctx.dequant_shape
+        )
+        dx, _, _ = GMMFunction.builder.load().npu_gmm_backward([grad_outputs], [x], [w], group_list, 0)
+        return dx[0], None, None, None
+
+
 def parallel_linear_save_to_state_dict_wrapper(fn):
     def wrapper(self, destination, prefix, keep_vars):
         """

@@ -52,6 +52,18 @@ class LoraFeature(MindSpeedFeature):
             help='Dequantize weights to original precision when saving in QLoRA tuning.',
         )
 
+        qlora_opt_group = parser.add_argument_group(title='qlora memory optimizations')
+        qlora_opt_group.add_argument(
+            '--expert-dequant-recompute',
+            action='store_true',
+            default=False,
+            help='Dequantize the NF4 expert weights (GroupedMLP w1/w2) locally inside the grouped '
+                 'GEMM autograd function, in forward and again in backward, instead of '
+                 'pre-dequantizing them in LoraParallelGroupedMLP.forward and pinning the full '
+                 'bf16 copies in the autograd graph until backward. At most one transient '
+                 'dequantized weight exists at any time. Applies to the non-overlap MoE path.',
+        )
+
     def register_patches(self, patch_manager, args):
         # for qlora
         from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
@@ -140,6 +152,11 @@ class LoraFeature(MindSpeedFeature):
             )
 
     def validate_args(self, args):
+        from mindspeed_llm.tasks.posttrain.lora.utils import is_enable_qlora
+
+        if getattr(args, 'expert_dequant_recompute', False) and not is_enable_qlora(args):
+            raise AssertionError('--expert-dequant-recompute is only supported with --qlora.')
+
         has_valid_lora_target = hasattr(args, 'lora_target_modules') and args.lora_target_modules
 
         if args.num_experts and (has_valid_lora_target and args.moe_token_dispatcher_type != "alltoall_seq"):  # nosec
