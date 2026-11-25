@@ -48,6 +48,15 @@ class MHCFeature(MindSpeedFeature):
                 'megatron.core.pipeline_parallel.schedules.get_tensor_shapes', get_tensor_shapes_in_mhc
             )
 
+            # make variable-length p2p shape exchange ndim-aware (stock assumes 3-D,
+            # mHC boundary tensors are 4-D) — needed for --no-pad-to-seq-lengths at PP > 1
+            from mindspeed_llm.tasks.models.transformer.deepseek4.mhc import communicate_shapes_in_mhc
+
+            patch_manager.register_patch(
+                'megatron.core.pipeline_parallel.p2p_communication._communicate_shapes',
+                communicate_shapes_in_mhc,
+            )
+
             if (
                 getattr(args, "num_layers_per_virtual_pipeline_stage", False)
                 and args.num_layers_per_virtual_pipeline_stage is not None

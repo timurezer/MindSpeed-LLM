@@ -439,6 +439,97 @@ def get_tensor_shapes_in_mhc(
     return tensor_shapes
 
 
+def communicate_shapes_in_mhc(tensor_send_next, tensor_send_prev, recv_prev, recv_next, config):
+    """ndim-aware replacement for p2p_communication._communicate_shapes.
+
+    The stock implementation exchanges tensor shapes through a hardcoded 3-element
+    buffer. With MHC the pipeline boundary tensor is 4-D [s, b, hc_mult, hidden], so the
+    sender's 4-element shape is truncated by the receiver, which then allocates a wrong
+    3-D receive buffer (NOPAD variable-length path crashed in hc_pre with
+    "input.dim() = 3 is not equal to len(dims) = 4"). Here the buffer length matches the
+    boundary tensor's ndim (4 with MHC, 3 otherwise). Same protocol otherwise.
+    """
+    tensor_dim = 4 if get_args().enable_mhc else 3
+
+    recv_prev_shape_tensor = None
+    recv_next_shape_tensor = None
+    send_prev_shape_tensor = None
+    send_next_shape_tensor = None
+    if recv_prev:
+        recv_prev_shape_tensor = torch.empty(
+            (tensor_dim), device=torch.cuda.current_device(), dtype=torch.int64
+        )
+    if recv_next:
+        recv_next_shape_tensor = torch.empty(
+            (tensor_dim), device=torch.cuda.current_device(), dtype=torch.int64
+        )
+    if tensor_send_prev is not None:
+        send_prev_shape_tensor = torch.tensor(
+            tensor_send_prev.size(), device=torch.cuda.current_device(), dtype=torch.int64
+        )
+    if tensor_send_next is not None:
+        send_next_shape_tensor = torch.tensor(
+            tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
+        )
+
+    if config.use_ring_exchange_p2p:
+        torch.distributed.ring_exchange(
+            tensor_send_prev=send_prev_shape_tensor,
+            tensor_recv_prev=recv_prev_shape_tensor,
+            tensor_send_next=send_next_shape_tensor,
+            tensor_recv_next=recv_next_shape_tensor,
+            group=p2p_communication.get_pipeline_model_parallel_group(),
+        )
+    else:
+        ops = []
+        if send_prev_shape_tensor is not None:
+            send_prev_op = torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_prev_shape_tensor,
+                p2p_communication.get_pipeline_model_parallel_prev_rank(),
+            )
+            ops.append(send_prev_op)
+        if recv_prev_shape_tensor is not None:
+            recv_prev_op = torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_prev_shape_tensor,
+                p2p_communication.get_pipeline_model_parallel_prev_rank(),
+            )
+            ops.append(recv_prev_op)
+        if send_next_shape_tensor is not None:
+            send_next_op = torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_next_shape_tensor,
+                p2p_communication.get_pipeline_model_parallel_next_rank(),
+            )
+            ops.append(send_next_op)
+        if recv_next_shape_tensor is not None:
+            recv_next_op = torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_next_shape_tensor,
+                p2p_communication.get_pipeline_model_parallel_next_rank(),
+            )
+            ops.append(recv_next_op)
+        if len(ops) > 0:
+            reqs = torch.distributed.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+        # To protect against race condition when using batch_isend_irecv().
+        # should take this out once the bug with batch_isend_irecv is resolved.
+        torch.cuda.synchronize()
+
+    recv_prev_shape = [0] * tensor_dim
+    if recv_prev_shape_tensor is not None:
+        recv_prev_shape = recv_prev_shape_tensor.tolist()
+
+    recv_next_shape = [0] * tensor_dim
+    if recv_next_shape_tensor is not None:
+        recv_next_shape = recv_next_shape_tensor.tolist()
+
+    return recv_prev_shape, recv_next_shape
+
+
 def forward_backward_pipelining_with_interleaving_in_mhc(
     *,
     forward_step_func,
