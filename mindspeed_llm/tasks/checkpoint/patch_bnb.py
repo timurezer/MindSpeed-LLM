@@ -1,150 +1,10 @@
 import ctypes as ct
-import os
 import torch
 from typing import Optional
 
-import bitsandbytes as bnb
 from bitsandbytes.utils import QuantState
 from bitsandbytes.cextension import lib
-from bitsandbytes.functional import get_4bit_type, get_ptr
-
-
-def _patched_quantize_4bit(
-    self,
-    A: torch.Tensor,
-    absmax: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    blocksize: Optional[int] = None,
-    compress_statistics=False,
-    quant_type="nf4",
-    quant_storage=torch.uint8,
-):
-    if quant_type not in ["nf4"]:
-        raise NotImplementedError(f"4-bit quantization data type {quant_type} is not implemented.")
-    if blocksize is None:
-        blocksize = 64
-    total_blocks = A.numel() // blocksize
-    chunks = max(128, total_blocks // 2048)         # number of chunks is 128 instead of 8
-    chunksize = (total_blocks + chunks - 1) // chunks
-    prev_device = torch.npu.current_device()
-    torch.npu.set_device(A.device)
-    if A.dtype in [torch.float32, torch.float16, torch.bfloat16]:
-        data = [
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-            0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
-            0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
-            0.7229568362236023, 1.0,
-        ]
-        data = torch.tensor(data, device="npu", dtype=torch.float32).view(1, -1)
-        chunks_absmax = []
-        chunks_out = []
-        for i in range(chunks):
-            start = i * chunksize * blocksize
-            end = min((i + 1) * chunksize * blocksize, A.numel())
-            chunk_data = A.view(-1)[start:end].view(-1, blocksize)
-            absmax = chunk_data.abs().max(dim=1, keepdim=True).values
-            chunks_absmax.append(absmax)
-            a = chunk_data / absmax.float()
-            diff = torch.abs(a.unsqueeze(-1) - data)
-            out = (torch.argmin(diff, dim=-1) + 8) % 16
-            out = out.reshape(-1, 2)
-            out = (out[:, 0] + out[:, 1] * 16).to(torch.uint8)
-            chunks_out.append(out)
-            del diff, a, chunk_data, absmax
-        absmax = torch.cat(chunks_absmax, dim=0)
-        out = torch.cat(chunks_out, dim=0)
-    else:
-        raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
-    torch.npu.set_device(prev_device)
-    code = get_4bit_type(quant_type, device=A.device)
-    state = QuantState(
-        absmax=absmax,
-        shape=A.shape,
-        dtype=A.dtype,
-        blocksize=blocksize,
-        code=code,
-        quant_type=quant_type,
-    )
-    return out, state
-
-
-_QUANT_THREADS_CONFIGURED = False
-
-
-def _configure_quant_threads():
-    """Raise ATen intra-op threads (the env often pins OMP_NUM_THREADS=1)."""
-    global _QUANT_THREADS_CONFIGURED
-    if _QUANT_THREADS_CONFIGURED:
-        return
-    _QUANT_THREADS_CONFIGURED = True
-    env_threads = os.environ.get("QLORA_QUANT_CPU_THREADS")
-    try:
-        target = int(env_threads) if env_threads else min(96, os.cpu_count() or 1)
-        if torch.get_num_threads() < target:
-            torch.set_num_threads(target)
-    except Exception:
-        pass
-
-
-def quantize_nf4_cpu(A: torch.Tensor, blocksize: int = 64):
-    """CPU replica of the patched NPUBackend.quantize_4bit above (nf4 only).
-
-    Runs the exact same pure-PyTorch math without any torch.npu calls, so the
-    output is bit-identical to the NPU path: per-block absmax kept in the input
-    dtype as a [blocks, 1] tensor, nearest-neighbor NF4 lookup with the
-    (argmin + 8) % 16 nibble rotation expected by the AscendC dequant kernel in
-    libbitsandbytes_npu.so, packed uint8 pairs as a flat [n/2] tensor.
-
-    Chunk sizes only bound peak memory (blocks are independent), so they are
-    sized for parallel efficiency instead of matching the NPU chunking. Thread
-    count can be tuned via QLORA_QUANT_CPU_THREADS (default: min(96, ncpu)).
-    """
-    _configure_quant_threads()
-    if A.device.type != "cpu":
-        A = A.to("cpu")
-    A = A.contiguous()
-    target_chunk_elements = 4 * 1024 * 1024
-    chunks = max(1, -(-A.numel() // target_chunk_elements))
-    chunksize = (-(-A.numel() // chunks) + blocksize - 1) // blocksize
-    if A.dtype in [torch.float32, torch.float16, torch.bfloat16]:
-        data = [
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-            0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
-            0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
-            0.7229568362236023, 1.0,
-        ]
-        data = torch.tensor(data, dtype=torch.float32).view(1, -1)
-        chunks_absmax = []
-        chunks_out = []
-        for i in range(chunks):
-            start = i * chunksize * blocksize
-            end = min((i + 1) * chunksize * blocksize, A.numel())
-            chunk_data = A.view(-1)[start:end].view(-1, blocksize)
-            absmax = chunk_data.abs().max(dim=1, keepdim=True).values
-            chunks_absmax.append(absmax)
-            a = chunk_data / absmax.float()
-            diff = torch.abs(a.unsqueeze(-1) - data)
-            out = (torch.argmin(diff, dim=-1) + 8) % 16
-            out = out.reshape(-1, 2)
-            out = (out[:, 0] + out[:, 1] * 16).to(torch.uint8)
-            chunks_out.append(out)
-            del diff, a, chunk_data, absmax
-        absmax = torch.cat(chunks_absmax, dim=0)
-        out = torch.cat(chunks_out, dim=0)
-    else:
-        raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
-    code = get_4bit_type("nf4", device=A.device)
-    state = QuantState(
-        absmax=absmax,
-        shape=A.shape,
-        dtype=A.dtype,
-        blocksize=blocksize,
-        code=code,
-        quant_type="nf4",
-    )
-    return out, state
+from bitsandbytes.functional import get_ptr
 
 
 def _patched_dequantize_4bit(
@@ -273,5 +133,4 @@ def apply_bnb_npu_patches():
     """Patch bitsandbytes NPU kernels to reduce peak NPU memory usage."""
     from bitsandbytes.backends.npu import NPUBackend
 
-    NPUBackend.quantize_4bit = _patched_quantize_4bit
     NPUBackend.dequantize_4bit = _patched_dequantize_4bit
